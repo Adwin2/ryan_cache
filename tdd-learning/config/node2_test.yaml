@@ -1,0 +1,12 @@
+# 节点2测试配置文件（2节点集群）
+node_id: "node2"
+address: ":8002"
+
+# 集群节点配置（只包含2个节点）
+cluster_nodes:
+  node1: "localhost:8001"
+  node2: "localhost:8002"
+
+# 缓存配置
+cache_size: 1000        # 每个节点的缓存大小
+virtual_nodes: 150      # 虚拟节点数量

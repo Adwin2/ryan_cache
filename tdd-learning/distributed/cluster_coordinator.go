@@ -63,6 +63,12 @@ func (cc *ClusterCoordinator) AddNodeToCluster(nodeID, address string) error {
 		log.Printf("❌ 添加节点到哈希环失败: %v", err)
 		return fmt.Errorf("添加节点失败: %v", err)
 	}
+
+	// 4. 执行真实的网络数据迁移
+	if err := cc.performNetworkDataMigration(nodeID, address); err != nil {
+		log.Printf("⚠️ 网络数据迁移失败: %v", err)
+		// 不返回错误，因为哈希环已经更新，数据迁移可以稍后重试
+	}
 	
 	// 4. 广播节点变更到集群中的所有其他节点
 	if err := cc.broadcastNodeChange(nodeID, address, "add"); err != nil {
@@ -200,6 +206,12 @@ func (cc *ClusterCoordinator) SyncAddNode(nodeID, address string) error {
 		return err
 	}
 
+	// 4. 执行真实的网络数据迁移
+	if err := cc.performNetworkDataMigration(nodeID, address); err != nil {
+		log.Printf("⚠️ 同步数据迁移失败: %v", err)
+		// 不返回错误，因为哈希环已经更新
+	}
+
 	log.Printf("✅ 同步添加节点完成: %s", nodeID)
 	return nil
 }
@@ -222,6 +234,84 @@ func (cc *ClusterCoordinator) SyncRemoveNode(nodeID string) error {
 
 	log.Printf("✅ 同步移除节点完成: %s", nodeID)
 	return nil
+}
+
+// performNetworkDataMigration 执行真实的网络数据迁移
+func (cc *ClusterCoordinator) performNetworkDataMigration(newNodeID, newNodeAddress string) error {
+	log.Printf("🔄 开始网络数据迁移到节点: %s (%s)", newNodeID, newNodeAddress)
+
+	startTime := time.Now()
+	migratedCount := 0
+
+	// 获取本地缓存的所有数据
+	localCache := cc.node.localCache
+	allData := localCache.GetAllData()
+
+	// 检查每个数据项是否应该迁移到新节点
+	for key, value := range allData {
+		// 重新计算这个key现在应该存储在哪个节点
+		targetNodeID := cc.node.hashRing.GetNodeForKey(key)
+
+		if targetNodeID == newNodeID {
+			// 这个key现在应该存储在新节点，需要迁移
+			if err := cc.migrateKeyToNode(key, value, newNodeAddress); err != nil {
+				log.Printf("❌ 迁移key失败: %s -> %s, 错误: %v", key, newNodeID, err)
+				continue
+			}
+
+			// 迁移成功，从本地缓存删除
+			localCache.Delete(key)
+			migratedCount++
+			log.Printf("✅ 迁移key: %s -> %s", key, newNodeID)
+		}
+	}
+
+	log.Printf("✅ 网络数据迁移完成: 迁移了 %d 个key到节点 %s", migratedCount, newNodeID)
+
+	// 更新迁移统计信息
+	cc.updateMigrationStats(migratedCount, time.Since(startTime))
+
+	return nil
+}
+
+// migrateKeyToNode 将单个key迁移到指定节点
+func (cc *ClusterCoordinator) migrateKeyToNode(key, value, nodeAddress string) error {
+	url := fmt.Sprintf("http://%s/internal/cache/%s", nodeAddress, key)
+
+	requestBody := map[string]string{"value": value}
+	jsonData, err := json.Marshal(requestBody)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("PUT", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := cc.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("HTTP状态码: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// updateMigrationStats 更新迁移统计信息
+func (cc *ClusterCoordinator) updateMigrationStats(migratedCount int, duration time.Duration) {
+	// 更新哈希环的迁移统计
+	cc.node.hashRing.Mu.Lock()
+	defer cc.node.hashRing.Mu.Unlock()
+
+	cc.node.hashRing.BasicMigrationStats.MigratedKeys += migratedCount
+	cc.node.hashRing.BasicMigrationStats.Duration += duration
+	cc.node.hashRing.BasicMigrationStats.LastMigration = time.Now()
 }
 
 // GetMigrationStats 获取数据迁移统计信息
