@@ -1,3 +1,4 @@
+// 测试客户端 ： ./bin/cache_client
 package main
 
 import (

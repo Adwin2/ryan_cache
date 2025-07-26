@@ -187,16 +187,19 @@ func (cc *ClusterCoordinator) sendNodeChangeRequest(targetAddress string, jsonDa
 // SyncAddNode 同步添加节点（接收广播）
 func (cc *ClusterCoordinator) SyncAddNode(nodeID, address string) error {
 	log.Printf("🔄 同步添加节点: %s (%s)", nodeID, address)
-	
+
 	// 1. 添加到集群管理器
 	cc.cluster.AddNode(nodeID, address)
-	
-	// 2. 添加到哈希环（这会触发数据迁移）
+
+	// 2. 更新本地节点的集群配置
+	cc.node.AddClusterNode(nodeID, address)
+
+	// 3. 添加到哈希环（这会触发数据迁移）
 	if err := cc.node.hashRing.AddNode(nodeID); err != nil {
 		log.Printf("❌ 同步添加节点到哈希环失败: %v", err)
 		return err
 	}
-	
+
 	log.Printf("✅ 同步添加节点完成: %s", nodeID)
 	return nil
 }
@@ -204,16 +207,19 @@ func (cc *ClusterCoordinator) SyncAddNode(nodeID, address string) error {
 // SyncRemoveNode 同步移除节点（接收广播）
 func (cc *ClusterCoordinator) SyncRemoveNode(nodeID string) error {
 	log.Printf("🔄 同步移除节点: %s", nodeID)
-	
+
 	// 1. 从哈希环移除（这会触发数据迁移）
 	if err := cc.node.hashRing.RemoveNode(nodeID); err != nil {
 		log.Printf("❌ 同步从哈希环移除节点失败: %v", err)
 		return err
 	}
-	
+
 	// 2. 从集群管理器移除
 	cc.cluster.RemoveNode(nodeID)
-	
+
+	// 3. 从本地节点的集群配置中移除
+	cc.node.RemoveClusterNode(nodeID)
+
 	log.Printf("✅ 同步移除节点完成: %s", nodeID)
 	return nil
 }

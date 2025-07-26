@@ -92,38 +92,62 @@ func (dn *DistributedNode) Set(key, value string) error {
 		return nil
 	}
 
-	// 3. 如果是远程节点，转发请求
-	return dn.forwardSetRequest(targetNodeID, key, value)
+	// 3. 如果是远程节点，转发请求（需要读取集群配置，加读锁保护）
+	dn.mu.RLock()
+	targetAddress, exists := dn.clusterNodes[targetNodeID]
+	dn.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("目标节点不存在: %s", targetNodeID)
+	}
+
+	return dn.forwardSetRequestSafe(targetAddress, key, value)
 }
 
 // Get 获取缓存数据
 func (dn *DistributedNode) Get(key string) (string, bool, error) {
 	// 1. 通过哈希环确定数据存储在哪个节点
 	targetNodeID := dn.hashRing.GetNodeForKey(key)
-	
+
 	// 2. 如果是本地节点，直接获取
 	if targetNodeID == dn.nodeID {
 		value, found := dn.localCache.Get(key)
 		return value, found, nil
 	}
-	
-	// 3. 如果是远程节点，转发请求
-	return dn.forwardGetRequest(targetNodeID, key)
+
+	// 3. 如果是远程节点，转发请求（需要读取集群配置，加读锁保护）
+	dn.mu.RLock()
+	targetAddress, exists := dn.clusterNodes[targetNodeID]
+	dn.mu.RUnlock()
+
+	if !exists {
+		return "", false, fmt.Errorf("目标节点不存在: %s", targetNodeID)
+	}
+
+	return dn.forwardGetRequestSafe(targetAddress, key)
 }
 
 // Delete 删除缓存数据
 func (dn *DistributedNode) Delete(key string) error {
 	// 1. 通过哈希环确定数据存储在哪个节点
 	targetNodeID := dn.hashRing.GetNodeForKey(key)
-	
+
 	// 2. 如果是本地节点，直接删除
 	if targetNodeID == dn.nodeID {
 		dn.localCache.Delete(key)
 		return nil
 	}
-	
-	// 3. 如果是远程节点，转发请求
-	return dn.forwardDeleteRequest(targetNodeID, key)
+
+	// 3. 如果是远程节点，转发请求（需要读取集群配置，加读锁保护）
+	dn.mu.RLock()
+	targetAddress, exists := dn.clusterNodes[targetNodeID]
+	dn.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("目标节点不存在: %s", targetNodeID)
+	}
+
+	return dn.forwardDeleteRequestSafe(targetAddress, key)
 }
 
 // GetLocalStats 获取本地缓存统计信息
@@ -156,12 +180,8 @@ func (dn *DistributedNode) IsLocalKey(key string) bool {
 
 // ===== 内部方法 =====
 
-// forwardSetRequest 转发SET请求到目标节点
-func (dn *DistributedNode) forwardSetRequest(targetNodeID, key, value string) error {
-	targetAddress, exists := dn.clusterNodes[targetNodeID]
-	if !exists {
-		return fmt.Errorf("目标节点不存在: %s", targetNodeID)
-	}
+// forwardSetRequestSafe 转发SET请求到目标节点（线程安全版本）
+func (dn *DistributedNode) forwardSetRequestSafe(targetAddress, key, value string) error {
 	
 	// 构造请求数据
 	reqData := map[string]string{"value": value}
@@ -191,12 +211,8 @@ func (dn *DistributedNode) forwardSetRequest(targetNodeID, key, value string) er
 	return nil
 }
 
-// forwardGetRequest 转发GET请求到目标节点
-func (dn *DistributedNode) forwardGetRequest(targetNodeID, key string) (string, bool, error) {
-	targetAddress, exists := dn.clusterNodes[targetNodeID]
-	if !exists {
-		return "", false, fmt.Errorf("目标节点不存在: %s", targetNodeID)
-	}
+// forwardGetRequestSafe 转发GET请求到目标节点（线程安全版本）
+func (dn *DistributedNode) forwardGetRequestSafe(targetAddress, key string) (string, bool, error) {
 	
 	// 发送内部API请求
 	url := fmt.Sprintf("http://%s/internal/cache/%s", targetAddress, key)
@@ -224,12 +240,8 @@ func (dn *DistributedNode) forwardGetRequest(targetNodeID, key string) (string, 
 	return response.Value, response.Found, nil
 }
 
-// forwardDeleteRequest 转发DELETE请求到目标节点
-func (dn *DistributedNode) forwardDeleteRequest(targetNodeID, key string) error {
-	targetAddress, exists := dn.clusterNodes[targetNodeID]
-	if !exists {
-		return fmt.Errorf("目标节点不存在: %s", targetNodeID)
-	}
+// forwardDeleteRequestSafe 转发DELETE请求到目标节点（线程安全版本）
+func (dn *DistributedNode) forwardDeleteRequestSafe(targetAddress, key string) error {
 	
 	// 发送内部API请求
 	url := fmt.Sprintf("http://%s/internal/cache/%s", targetAddress, key)
@@ -265,4 +277,50 @@ func (dn *DistributedNode) GetLocal(key string) (string, bool) {
 // DeleteLocal 直接从本地缓存删除 - 用于内部API
 func (dn *DistributedNode) DeleteLocal(key string) {
 	dn.localCache.Delete(key)
+}
+
+// ===== 集群配置管理方法 =====
+
+// UpdateClusterNodes 更新集群节点配置（线程安全）
+func (dn *DistributedNode) UpdateClusterNodes(nodes map[string]string) {
+	dn.mu.Lock()
+	defer dn.mu.Unlock()
+
+	// 创建新的映射副本
+	newNodes := make(map[string]string)
+	for nodeID, address := range nodes {
+		newNodes[nodeID] = address
+	}
+
+	dn.clusterNodes = newNodes
+}
+
+// AddClusterNode 添加集群节点（线程安全）
+func (dn *DistributedNode) AddClusterNode(nodeID, address string) {
+	dn.mu.Lock()
+	defer dn.mu.Unlock()
+
+	dn.clusterNodes[nodeID] = address
+}
+
+// RemoveClusterNode 移除集群节点（线程安全）
+func (dn *DistributedNode) RemoveClusterNode(nodeID string) {
+	dn.mu.Lock()
+	defer dn.mu.Unlock()
+
+	delete(dn.clusterNodes, nodeID)
+}
+
+// GetClusterNodes 获取集群节点配置（线程安全）
+func (dn *DistributedNode) GetClusterNodes() map[string]string {
+	dn.mu.RLock()
+	defer dn.mu.RUnlock()
+
+	// 返回副本，避免外部修改
+	nodes := make(map[string]string)
+	for nodeID, address := range dn.clusterNodes {
+		nodes[nodeID] = address
+	}
+
+	return nodes
 }
