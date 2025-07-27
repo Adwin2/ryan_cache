@@ -16,9 +16,7 @@ import (
 // NodeServer 分布式节点服务器
 // 将 DistributedNode 包装为 HTTP 服务
 type NodeServer struct {
-	nodeID      string
-	address     string
-	node        *DistributedNode // 使用新的 DistributedNode
+	node        *DistributedNode
 	cluster     *ClusterManager
 	handlers    *APIHandlers
 	router      *gin.Engine
@@ -40,8 +38,6 @@ func NewNodeServer(config NodeConfig) *NodeServer {
 
 	// 创建节点服务器
 	server := &NodeServer{
-		nodeID:   config.NodeID,
-		address:  config.Address,
 		node:     node,
 		cluster:  cluster,
 		handlers: handlers,
@@ -117,17 +113,17 @@ func (ns *NodeServer) corsMiddleware() gin.HandlerFunc {
 func (ns *NodeServer) Start() error {
 	// 创建HTTP服务器
 	ns.server = &http.Server{
-		Addr:    ns.address,
+		Addr:    ns.node.GetNodeAddress(),
 		Handler: ns.router,
 	}
-	
+
 	// 启动集群管理器
 	if err := ns.cluster.Start(); err != nil {
 		return fmt.Errorf("启动集群管理器失败: %v", err)
 	}
-	
-	log.Printf("🚀 启动分布式缓存节点: %s", ns.nodeID)
-	log.Printf("📡 监听地址: %s", ns.address)
+
+	log.Printf("🚀 启动分布式缓存节点: %s", ns.node.GetNodeID())
+	log.Printf("📡 监听地址: %s", ns.node.GetNodeAddress())
 	log.Printf("🌐 集群节点数: %d", len(ns.cluster.GetNodes()))
 	
 	// 启动HTTP服务器
@@ -149,7 +145,7 @@ func (ns *NodeServer) waitForShutdown() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	
-	log.Printf("🛑 正在关闭节点: %s", ns.nodeID)
+	log.Printf("🛑 正在关闭节点: %s", ns.node.GetNodeID())
 	
 	// 优雅关闭
 	ns.Shutdown()
@@ -173,17 +169,17 @@ func (ns *NodeServer) Shutdown() {
 	// 停止集群管理器
 	ns.cluster.Stop()
 	
-	log.Printf("✅ 节点 %s 已关闭", ns.nodeID)
+	log.Printf("✅ 节点 %s 已关闭", ns.node.GetNodeID())
 }
 
 // GetNodeID 获取节点ID
 func (ns *NodeServer) GetNodeID() string {
-	return ns.nodeID
+	return ns.node.GetNodeID()
 }
 
 // GetAddress 获取节点地址
 func (ns *NodeServer) GetAddress() string {
-	return ns.address
+	return ns.node.GetNodeAddress()
 }
 
 // GetNode 获取分布式节点实例

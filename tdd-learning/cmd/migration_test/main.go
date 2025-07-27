@@ -23,6 +23,7 @@ type MigrationTester struct {
 	newNode      NodeInfo
 	testData     map[string]string
 	httpClient   *http.Client
+	client       *distributed.DistributedClient  // 添加分布式客户端
 }
 
 // NodeInfo 节点信息
@@ -61,11 +62,23 @@ func main() {
 
 // NewMigrationTester 创建数据迁移测试器
 func NewMigrationTester() *MigrationTester {
-	return &MigrationTester{
-		initialNodes: []NodeInfo{
-			{NodeID: "node1", Address: "localhost:8001", Port: 8001},
-			{NodeID: "node2", Address: "localhost:8002", Port: 8002},
+	initialNodes := []NodeInfo{
+		{NodeID: "node1", Address: "localhost:8001", Port: 8001},
+		{NodeID: "node2", Address: "localhost:8002", Port: 8002},
+	}
+
+	// 创建分布式客户端配置
+	clientConfig := distributed.ClientConfig{
+		Nodes: []string{
+			"localhost:8001",
+			"localhost:8002",
 		},
+		Timeout:    10 * time.Second,
+		RetryCount: 3,
+	}
+
+	return &MigrationTester{
+		initialNodes: initialNodes,
 		newNode: NodeInfo{
 			NodeID: "node4", Address: "localhost:8004", Port: 8004,
 		},
@@ -90,6 +103,7 @@ func NewMigrationTester() *MigrationTester {
 			"cache:key3":   "缓存值3",
 		},
 		httpClient: &http.Client{Timeout: 10 * time.Second},
+		client:     distributed.NewDistributedClient(clientConfig),
 	}
 }
 
@@ -298,30 +312,10 @@ func (mt *MigrationTester) setupTestData() error {
 	return nil
 }
 
-// setCache 设置缓存数据
+// setCache 设置缓存数据 (使用分布式客户端负载均衡)
 func (mt *MigrationTester) setCache(key, value string) error {
-	url := fmt.Sprintf("http://localhost:%d/api/v1/cache/%s", mt.initialNodes[0].Port, key)
-
-	requestBody := map[string]string{"value": value}
-	jsonData, _ := json.Marshal(requestBody)
-
-	req, err := http.NewRequest("PUT", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := mt.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("HTTP状态码: %d", resp.StatusCode)
-	}
-
-	return nil
+	// 使用分布式客户端，自动负载均衡到不同节点
+	return mt.client.Set(key, value)
 }
 
 // captureDataDistribution 捕获数据分布
@@ -477,39 +471,11 @@ func (mt *MigrationTester) verifyDataIntegrity() (float64, error) {
 	return integrity, nil
 }
 
-// getCache 获取缓存数据
+// getCache 获取缓存数据 (使用分布式客户端负载均衡)
 func (mt *MigrationTester) getCache(key string) (bool, string, error) {
-	// 随机选择一个健康的节点
-	allNodes := append(mt.initialNodes, mt.newNode)
-
-	for _, node := range allNodes {
-		if !mt.isNodeHealthy(node.Port) {
-			continue
-		}
-
-		url := fmt.Sprintf("http://localhost:%d/api/v1/cache/%s", node.Port, key)
-		resp, err := mt.httpClient.Get(url)
-		if err != nil {
-			continue
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != 200 {
-			continue
-		}
-
-		var response map[string]interface{}
-		if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-			continue
-		}
-
-		found, _ := response["found"].(bool)
-		value, _ := response["value"].(string)
-
-		return found, value, nil
-	}
-
-	return false, "", fmt.Errorf("无法从任何节点获取数据")
+	// 使用分布式客户端，自动负载均衡和故障转移
+	value, found, err := mt.client.Get(key)
+	return found, value, err
 }
 
 // collectMigrationStats 收集迁移统计信息

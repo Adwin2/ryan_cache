@@ -1,2 +1,7 @@
 logs/
 bin/
+test_*
+*_test
+*_benchmark
+*_analyzer
+*.bak
