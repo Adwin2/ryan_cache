@@ -6,9 +6,38 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 )
+
+// NodeStatus 节点状态
+type NodeStatus struct {
+	Address         string
+	IsHealthy       bool
+	FailureCount    int
+	LastCheckTime   time.Time
+	LastFailureTime time.Time
+	LastSuccessTime time.Time
+}
+
+// NodeManager 节点管理器
+type NodeManager struct {
+	seedNodes     []string
+	activeNodes   []string
+	nodeStatus    map[string]*NodeStatus
+	mu            sync.RWMutex
+
+	healthChecker *HealthChecker
+	stopChan      chan struct{}
+	config        ClientConfig
+}
+
+// HealthChecker 健康检查器
+type HealthChecker struct {
+	httpClient *http.Client
+	manager    *NodeManager
+}
 
 // DistributedClient 分布式缓存客户端
 // 提供对分布式缓存集群的访问接口
@@ -19,32 +48,99 @@ type DistributedClient struct {
 	mu           sync.Mutex
 	retryCount   int
 	timeout      time.Duration
+
+	// 新增：节点管理
+	nodeManager  *NodeManager
+	config       ClientConfig
 }
 
 // ClientConfig 客户端配置
 type ClientConfig struct {
-	Nodes       []string      `yaml:"nodes"`
-	Timeout     time.Duration `yaml:"timeout"`
-	RetryCount  int           `yaml:"retry_count"`
+	Nodes                 []string      `yaml:"nodes"`
+	Timeout               time.Duration `yaml:"timeout"`
+	RetryCount            int           `yaml:"retry_count"`
+
+	// 新增：健康检查配置
+	HealthCheckEnabled    bool          `yaml:"health_check_enabled"`    // 默认true
+	HealthCheckInterval   time.Duration `yaml:"health_check_interval"`   // 默认30s
+	FailureThreshold      int           `yaml:"failure_threshold"`       // 默认3次失败
+	RecoveryCheckInterval time.Duration `yaml:"recovery_check_interval"` // 默认60s
 }
 
 // NewDistributedClient 创建分布式缓存客户端
 func NewDistributedClient(config ClientConfig) *DistributedClient {
+	// 设置默认值
 	if config.Timeout == 0 {
 		config.Timeout = 5 * time.Second
 	}
 	if config.RetryCount == 0 {
 		config.RetryCount = 3
 	}
-	
-	return &DistributedClient{
+	if config.HealthCheckInterval == 0 {
+		config.HealthCheckInterval = 30 * time.Second
+	}
+	if config.FailureThreshold == 0 {
+		config.FailureThreshold = 3
+	}
+	if config.RecoveryCheckInterval == 0 {
+		config.RecoveryCheckInterval = 60 * time.Second
+	}
+	// 默认启用健康检查
+	if !config.HealthCheckEnabled {
+		config.HealthCheckEnabled = true
+	}
+
+	client := &DistributedClient{
 		nodes: config.Nodes,
 		httpClient: &http.Client{
 			Timeout: config.Timeout,
 		},
 		retryCount: config.RetryCount,
 		timeout:    config.Timeout,
+		config:     config,
 	}
+
+	// 创建节点管理器
+	client.nodeManager = NewNodeManager(config)
+
+	return client
+}
+
+// Close 关闭客户端，停止健康检查
+func (dc *DistributedClient) Close() {
+	if dc.nodeManager != nil {
+		dc.nodeManager.Stop()
+	}
+}
+
+// GetNodeStatus 获取所有节点的状态信息
+func (dc *DistributedClient) GetNodeStatus() map[string]*NodeStatus {
+	if dc.nodeManager == nil {
+		return nil
+	}
+
+	dc.nodeManager.mu.RLock()
+	defer dc.nodeManager.mu.RUnlock()
+
+	// 复制状态信息
+	status := make(map[string]*NodeStatus)
+	for node, nodeStatus := range dc.nodeManager.nodeStatus {
+		status[node] = &NodeStatus{
+			Address:         nodeStatus.Address,
+			IsHealthy:       nodeStatus.IsHealthy,
+			FailureCount:    nodeStatus.FailureCount,
+			LastCheckTime:   nodeStatus.LastCheckTime,
+			LastFailureTime: nodeStatus.LastFailureTime,
+			LastSuccessTime: nodeStatus.LastSuccessTime,
+		}
+	}
+
+	return status
+}
+
+// GetTimeout 获取客户端超时时间
+func (dc *DistributedClient) GetTimeout() time.Duration {
+	return dc.timeout
 }
 
 // Set 设置缓存
@@ -130,37 +226,70 @@ func (dc *DistributedClient) CheckHealth() (map[string]bool, error) {
 // executeWithRetry 执行操作并重试
 func (dc *DistributedClient) executeWithRetry(operation func(string) error) error {
 	var lastErr error
-	
+
 	for attempt := 0; attempt < dc.retryCount; attempt++ {
-		node := dc.getNextNode()
-		
+		node := dc.getNextHealthyNode()
+
 		err := operation(node)
 		if err == nil {
+			// 标记节点成功
+			if dc.nodeManager != nil {
+				dc.nodeManager.MarkSuccess(node)
+			}
 			return nil
 		}
-		
+
 		lastErr = err
-		
+
+		// 标记节点失败
+		if dc.nodeManager != nil {
+			dc.nodeManager.MarkFailure(node)
+		}
+
 		// 如果是网络错误，尝试下一个节点
 		if isNetworkError(err) {
 			continue
 		}
-		
+
 		// 如果是业务错误，直接返回
 		return err
 	}
-	
+
 	return fmt.Errorf("所有节点都不可用，最后错误: %v", lastErr)
 }
 
-// getNextNode 获取下一个节点（轮询）
+// getNextNode 获取下一个节点（轮询）- 保持向后兼容
 func (dc *DistributedClient) getNextNode() string {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
-	
+
 	node := dc.nodes[dc.currentNode]
 	dc.currentNode = (dc.currentNode + 1) % len(dc.nodes)
-	
+
+	return node
+}
+
+// getNextHealthyNode 获取下一个健康节点（智能选择）
+func (dc *DistributedClient) getNextHealthyNode() string {
+	// 如果没有节点管理器，使用传统轮询
+	if dc.nodeManager == nil {
+		return dc.getNextNode()
+	}
+
+	// 获取健康节点列表
+	healthyNodes := dc.nodeManager.GetHealthyNodes()
+	if len(healthyNodes) == 0 {
+		// 降级：使用原始节点列表
+		return dc.getNextNode()
+	}
+
+	// 在健康节点中轮询
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	node := healthyNodes[dc.currentNode % len(healthyNodes)]
+	dc.currentNode = (dc.currentNode + 1) % len(healthyNodes)
+
 	return node
 }
 
@@ -341,4 +470,186 @@ func (dc *DistributedClient) BatchDelete(keys []string) error {
 		}
 	}
 	return nil
+}
+
+// ===== NodeManager 实现 =====
+
+// NewNodeManager 创建节点管理器
+func NewNodeManager(config ClientConfig) *NodeManager {
+	manager := &NodeManager{
+		seedNodes:  make([]string, len(config.Nodes)),
+		nodeStatus: make(map[string]*NodeStatus),
+		stopChan:   make(chan struct{}),
+		config:     config,
+	}
+
+	// 复制种子节点列表
+	copy(manager.seedNodes, config.Nodes)
+
+	// 初始化所有节点状态
+	for _, node := range config.Nodes {
+		manager.nodeStatus[node] = &NodeStatus{
+			Address:         node,
+			IsHealthy:       true, // 初始假设所有节点健康
+			FailureCount:    0,
+			LastCheckTime:   time.Now(),
+			LastSuccessTime: time.Now(),
+		}
+	}
+
+	// 初始化活跃节点列表
+	manager.activeNodes = make([]string, len(config.Nodes))
+	copy(manager.activeNodes, config.Nodes)
+
+	// 创建健康检查器
+	if config.HealthCheckEnabled {
+		manager.healthChecker = &HealthChecker{
+			httpClient: &http.Client{Timeout: 3 * time.Second},
+			manager:    manager,
+		}
+
+		// 启动健康检查协程
+		go manager.startHealthCheckRoutine()
+
+		// 立即执行一次健康检查
+		go manager.performHealthCheck()
+	}
+
+	return manager
+}
+
+// GetHealthyNodes 获取健康的节点列表
+func (nm *NodeManager) GetHealthyNodes() []string {
+	nm.mu.RLock()
+	defer nm.mu.RUnlock()
+
+	var healthyNodes []string
+	for _, node := range nm.activeNodes {
+		if status, exists := nm.nodeStatus[node]; exists && status.IsHealthy {
+			healthyNodes = append(healthyNodes, node)
+		}
+	}
+
+	// 如果没有健康节点，返回所有节点（降级处理）
+	if len(healthyNodes) == 0 {
+		return nm.seedNodes
+	}
+
+	return healthyNodes
+}
+
+// MarkSuccess 标记节点成功
+func (nm *NodeManager) MarkSuccess(node string) {
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+
+	if status, exists := nm.nodeStatus[node]; exists {
+		status.IsHealthy = true
+		status.FailureCount = 0
+		status.LastSuccessTime = time.Now()
+
+		// 如果节点之前不在活跃列表中，重新添加
+		nm.ensureNodeInActiveList(node)
+	}
+}
+
+// MarkFailure 标记节点失败
+func (nm *NodeManager) MarkFailure(node string) {
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+
+	if status, exists := nm.nodeStatus[node]; exists {
+		status.FailureCount++
+		status.LastFailureTime = time.Now()
+
+		// 如果失败次数超过阈值，标记为不健康
+		if status.FailureCount >= nm.config.FailureThreshold {
+			status.IsHealthy = false
+		}
+	}
+}
+
+// ensureNodeInActiveList 确保节点在活跃列表中
+func (nm *NodeManager) ensureNodeInActiveList(node string) {
+	if slices.Contains(nm.activeNodes, node) {
+			return // 已经在列表中
+	}
+	// 不在列表中，添加
+	nm.activeNodes = append(nm.activeNodes, node)
+}
+
+// startHealthCheckRoutine 启动健康检查协程
+func (nm *NodeManager) startHealthCheckRoutine() {
+	ticker := time.NewTicker(nm.config.HealthCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			nm.performHealthCheck()
+		case <-nm.stopChan:
+			return
+		}
+	}
+}
+
+// performHealthCheck 执行健康检查
+func (nm *NodeManager) performHealthCheck() {
+	nm.mu.RLock()
+	nodes := make([]string, len(nm.seedNodes))
+	copy(nodes, nm.seedNodes)
+	nm.mu.RUnlock()
+
+	for _, node := range nodes {
+		go nm.checkSingleNode(node)
+	}
+}
+
+// checkSingleNode 检查单个节点
+func (nm *NodeManager) checkSingleNode(node string) {
+	healthy := nm.healthChecker.CheckNode(node)
+
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+
+	if status, exists := nm.nodeStatus[node]; exists {
+		status.LastCheckTime = time.Now()
+
+		if healthy {
+			if !status.IsHealthy {
+				// 节点恢复了
+				status.IsHealthy = true
+				status.FailureCount = 0
+				status.LastSuccessTime = time.Now()
+				nm.ensureNodeInActiveList(node)
+			}
+		} else {
+			status.FailureCount++
+			status.LastFailureTime = time.Now()
+			if status.FailureCount >= nm.config.FailureThreshold {
+				status.IsHealthy = false
+			}
+		}
+	}
+}
+
+// Stop 停止节点管理器
+func (nm *NodeManager) Stop() {
+	close(nm.stopChan)
+}
+
+// ===== HealthChecker 实现 =====
+
+// CheckNode 检查单个节点的健康状态
+func (hc *HealthChecker) CheckNode(node string) bool {
+	url := fmt.Sprintf("http://%s/api/v1/health", node)
+
+	resp, err := hc.httpClient.Get(url)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	// 200状态码表示健康
+	return resp.StatusCode == http.StatusOK
 }
