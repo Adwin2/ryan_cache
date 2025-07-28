@@ -73,9 +73,7 @@ func NewDistributedNode(config NodeConfig) *DistributedNode {
 		hashRing:     hashRing,
 		localCache:   localCache,
 		clusterNodes: config.ClusterNodes,
-		httpClient: &http.Client{
-			Timeout: 5 * time.Second,
-		},
+		httpClient: createNodeHTTPClient(5 * time.Second),
 	}
 	
 	return node

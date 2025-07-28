@@ -92,9 +92,7 @@ func NewDistributedClient(config ClientConfig) *DistributedClient {
 
 	client := &DistributedClient{
 		nodes: config.Nodes,
-		httpClient: &http.Client{
-			Timeout: config.Timeout,
-		},
+		httpClient: createClientHTTPClient(config.Timeout),
 		retryCount: config.RetryCount,
 		timeout:    config.Timeout,
 		config:     config,
@@ -104,6 +102,104 @@ func NewDistributedClient(config ClientConfig) *DistributedClient {
 	client.nodeManager = NewNodeManager(config)
 
 	return client
+}
+
+// ===== HTTP客户端工厂函数 =====
+
+// createClientHTTPClient 创建客户端HTTP客户端 - 高并发，长连接
+func createClientHTTPClient(timeout time.Duration) *http.Client {
+    return &http.Client{
+        Timeout: timeout,
+        Transport: &http.Transport{
+            // 高并发配置
+            MaxIdleConns:        200,              // 最大空闲连接数
+            MaxIdleConnsPerHost: 20,               // 每个host的最大空闲连接数
+            IdleConnTimeout:     120 * time.Second, // 长空闲连接超时
+            DisableKeepAlives:   false,            // 启用keep-alive
+            
+            // 连接超时设置
+            TLSHandshakeTimeout: 3 * time.Second,  // TLS握手超时
+
+            // 响应超时
+            ResponseHeaderTimeout: timeout / 2,    // 响应头超时为总超时的一半
+            ExpectContinueTimeout: 1 * time.Second,
+            
+            // 启用HTTP/2
+            ForceAttemptHTTP2: true,
+        },
+    }
+}
+
+// createHealthCheckHTTPClient 创建健康检查HTTP客户端 - 快速检查，短连接
+func createHealthCheckHTTPClient() *http.Client {
+    return &http.Client{
+        Timeout: 3 * time.Second,
+        Transport: &http.Transport{
+            // 轻量级配置
+            MaxIdleConns:        50,               // 较少的空闲连接
+            MaxIdleConnsPerHost: 5,                // 每个host少量连接
+            IdleConnTimeout:     30 * time.Second, // 短空闲超时
+            DisableKeepAlives:   false,            // 仍然启用keep-alive
+            
+            // 快速连接设置
+            TLSHandshakeTimeout: 1 * time.Second,  // 快速TLS握手
+            
+            // 快速响应
+            ResponseHeaderTimeout: 2 * time.Second,
+            ExpectContinueTimeout: 500 * time.Millisecond,
+            
+            // 禁用压缩以提高速度
+            DisableCompression: true,
+        },
+    }
+}
+
+// createNodeHTTPClient 创建节点间通信HTTP客户端 - 中等并发，中等连接
+func createNodeHTTPClient(timeout time.Duration) *http.Client {
+    return &http.Client{
+        Timeout: timeout,
+        Transport: &http.Transport{
+            // 中等并发配置
+            MaxIdleConns:        100,              // 中等空闲连接数
+            MaxIdleConnsPerHost: 10,               // 每个host中等连接数
+            IdleConnTimeout:     60 * time.Second, // 中等空闲超时
+            DisableKeepAlives:   false,            // 启用keep-alive
+            
+            // 平衡的连接设置
+            TLSHandshakeTimeout: 2 * time.Second,  // 中等TLS握手超时
+            
+            // 平衡的响应超时
+            ResponseHeaderTimeout: timeout / 3,    // 响应头超时
+            ExpectContinueTimeout: 1 * time.Second,
+            
+            // 启用压缩以节省带宽
+            DisableCompression: false,
+        },
+    }
+}
+
+// createCoordinatorHTTPClient 创建集群协调HTTP客户端 - 低频率，长超时
+func createCoordinatorHTTPClient(timeout time.Duration) *http.Client {
+    return &http.Client{
+        Timeout: timeout,
+        Transport: &http.Transport{
+            // 低频高可靠配置
+            MaxIdleConns:        30,               // 少量空闲连接
+            MaxIdleConnsPerHost: 3,                // 每个host少量连接
+            IdleConnTimeout:     300 * time.Second, // 长空闲超时
+            DisableKeepAlives:   false,            // 启用keep-alive
+            
+            // 可靠的连接设置
+            TLSHandshakeTimeout: 5 * time.Second,  // 较长TLS握手超时
+            
+            // 长响应超时
+            ResponseHeaderTimeout: timeout / 2,    // 长响应头超时
+            ExpectContinueTimeout: 2 * time.Second,
+            
+            // 启用压缩
+            DisableCompression: false,
+        },
+    }
 }
 
 // Close 关闭客户端，停止健康检查
@@ -504,7 +600,7 @@ func NewNodeManager(config ClientConfig) *NodeManager {
 	// 创建健康检查器
 	if config.HealthCheckEnabled {
 		manager.healthChecker = &HealthChecker{
-			httpClient: &http.Client{Timeout: 3 * time.Second},
+			httpClient: createHealthCheckHTTPClient(),
 			manager:    manager,
 		}
 

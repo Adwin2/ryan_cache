@@ -4,6 +4,8 @@ package main
 import (
 	"fmt"
 	"log"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"tdd-learning/distributed"
@@ -199,6 +201,14 @@ func main() {
 	// 9. 性能测试
 	fmt.Println("\n9. ⚡ 性能测试:")
 	performanceTest(client)
+
+	// 10. 并发性能测试
+	fmt.Println("\n10. 🚀 并发性能测试:")
+	concurrentPerformanceTest(client)
+
+	// 11. 连接池效果验证
+	fmt.Println("\n11. 🔗 连接池效果验证:")
+	connectionPoolTest(client)
 	
 	fmt.Println("\n✅ 智能分布式缓存测试完成！")
 	fmt.Println("\n🎯 新特性验证结果:")
@@ -304,14 +314,12 @@ func testLoadBalancing(client *distributed.DistributedClient) {
 	// 显示当前节点状态
 	fmt.Println("   📈 当前节点状态:")
 	nodeStatus := client.GetNodeStatus()
-	if nodeStatus != nil {
-		for node, status := range nodeStatus {
-			healthIcon := "✅"
-			if !status.IsHealthy {
-				healthIcon = "❌"
-			}
-			fmt.Printf("     %s %s (失败: %d)\n", healthIcon, node, status.FailureCount)
+	for node, status := range nodeStatus {
+		healthIcon := "✅"
+		if !status.IsHealthy {
+			healthIcon = "❌"
 		}
+		fmt.Printf("     %s %s (失败: %d)\n", healthIcon, node, status.FailureCount)
 	}
 
 	// 清理测试数据
@@ -375,5 +383,330 @@ func testFailover(client *distributed.DistributedClient) {
 	// 清理测试数据
 	for key := range testData {
 		client.Delete(key)
+	}
+}
+
+// concurrentPerformanceTest 并发性能测试
+func concurrentPerformanceTest(client *distributed.DistributedClient) {
+	fmt.Println("   🔄 执行并发性能测试...")
+
+	// 测试参数
+	numOperations := 1000
+	concurrencyLevels := []int{1, 5, 10, 20}
+
+	for _, concurrency := range concurrencyLevels {
+		fmt.Printf("\n   📊 并发度 %d 测试:\n", concurrency)
+
+		// 并发写测试
+		testConcurrentWrites(client, numOperations, concurrency)
+
+		// 并发读测试
+		testConcurrentReads(client, numOperations, concurrency)
+
+		// 混合读写测试
+		testMixedOperations(client, numOperations, concurrency)
+	}
+}
+
+// testConcurrentWrites 测试并发写操作
+func testConcurrentWrites(client *distributed.DistributedClient, total, concurrency int) {
+	var wg sync.WaitGroup
+	operationsPerWorker := total / concurrency
+
+	start := time.Now()
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for j := 0; j < operationsPerWorker; j++ {
+				key := fmt.Sprintf("concurrent:write:%d:%d", workerID, j)
+				value := fmt.Sprintf("value_%d_%d", workerID, j)
+				client.Set(key, value)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	duration := time.Since(start)
+	ops := float64(total) / duration.Seconds()
+
+	fmt.Printf("     ✍️  并发写: %.2f ops/s (%d 操作，%d 并发，耗时 %v)\n",
+		ops, total, concurrency, duration)
+
+	// 清理数据
+	for i := 0; i < concurrency; i++ {
+		for j := 0; j < operationsPerWorker; j++ {
+			key := fmt.Sprintf("concurrent:write:%d:%d", i, j)
+			client.Delete(key)
+		}
+	}
+}
+
+// testConcurrentReads 测试并发读操作
+func testConcurrentReads(client *distributed.DistributedClient, total, concurrency int) {
+	operationsPerWorker := total / concurrency
+
+	// 先准备测试数据
+	for i := 0; i < concurrency; i++ {
+		for j := 0; j < operationsPerWorker; j++ {
+			key := fmt.Sprintf("concurrent:read:%d:%d", i, j)
+			value := fmt.Sprintf("read_value_%d_%d", i, j)
+			client.Set(key, value)
+		}
+	}
+
+	var wg sync.WaitGroup
+	start := time.Now()
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for j := 0; j < operationsPerWorker; j++ {
+				key := fmt.Sprintf("concurrent:read:%d:%d", workerID, j)
+				client.Get(key)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	duration := time.Since(start)
+	ops := float64(total) / duration.Seconds()
+
+	fmt.Printf("     📖 并发读: %.2f ops/s (%d 操作，%d 并发，耗时 %v)\n",
+		ops, total, concurrency, duration)
+
+	// 清理数据
+	for i := 0; i < concurrency; i++ {
+		for j := 0; j < operationsPerWorker; j++ {
+			key := fmt.Sprintf("concurrent:read:%d:%d", i, j)
+			client.Delete(key)
+		}
+	}
+}
+
+// testMixedOperations 测试混合读写操作
+func testMixedOperations(client *distributed.DistributedClient, total, concurrency int) {
+	operationsPerWorker := total / concurrency
+	var wg sync.WaitGroup
+
+	start := time.Now()
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for j := 0; j < operationsPerWorker; j++ {
+				key := fmt.Sprintf("concurrent:mixed:%d:%d", workerID, j)
+
+				// 70%读操作，30%写操作
+				if j%10 < 7 {
+					// 读操作
+					client.Get(key)
+				} else {
+					// 写操作
+					value := fmt.Sprintf("mixed_value_%d_%d", workerID, j)
+					client.Set(key, value)
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	duration := time.Since(start)
+	ops := float64(total) / duration.Seconds()
+
+	fmt.Printf("     🔄 混合读写: %.2f ops/s (%d 操作，%d 并发，耗时 %v)\n",
+		ops, total, concurrency, duration)
+
+	// 清理数据
+	for i := 0; i < concurrency; i++ {
+		for j := 0; j < operationsPerWorker; j++ {
+			key := fmt.Sprintf("concurrent:mixed:%d:%d", i, j)
+			client.Delete(key)
+		}
+	}
+}
+
+// connectionPoolTest 连接池效果验证测试
+func connectionPoolTest(client *distributed.DistributedClient) {
+	fmt.Println("   🔗 验证连接池优化效果...")
+
+	// 测试1: 连续请求延迟测试
+	fmt.Println("\n   📊 连续请求延迟分析:")
+	testConnectionReuse(client)
+
+	// 测试2: 突发并发测试
+	fmt.Println("\n   📊 突发并发测试:")
+	testBurstConcurrency(client)
+
+	// 测试3: 长时间运行测试
+	fmt.Println("\n   📊 长时间运行测试:")
+	testLongRunning(client)
+}
+
+// testConnectionReuse 测试连接复用效果
+func testConnectionReuse(client *distributed.DistributedClient) {
+	numRequests := 100
+	latencies := make([]time.Duration, numRequests)
+
+	// 预热一次请求，建立连接
+	client.Set("warmup", "warmup_value")
+	client.Delete("warmup")
+
+	// 测试连续请求的延迟
+	for i := 0; i < numRequests; i++ {
+		key := fmt.Sprintf("latency_test_%d", i)
+		value := fmt.Sprintf("value_%d", i)
+
+		start := time.Now()
+		client.Set(key, value)
+		latencies[i] = time.Since(start)
+
+		client.Delete(key) // 立即清理
+	}
+
+	// 分析延迟分布
+	var total time.Duration
+	var min, max time.Duration = latencies[0], latencies[0]
+
+	for _, latency := range latencies {
+		total += latency
+		if latency < min {
+			min = latency
+		}
+		if latency > max {
+			max = latency
+		}
+	}
+
+	avg := total / time.Duration(numRequests)
+
+	fmt.Printf("     平均延迟: %v\n", avg)
+	fmt.Printf("     最小延迟: %v\n", min)
+	fmt.Printf("     最大延迟: %v\n", max)
+	fmt.Printf("     延迟比值: %.2fx (最大/最小)\n", float64(max)/float64(min))
+
+	// 分析前10次和后10次的延迟差异
+	var firstTen, lastTen time.Duration
+	for i := 0; i < 10; i++ {
+		firstTen += latencies[i]
+		lastTen += latencies[numRequests-10+i]
+	}
+
+	firstTenAvg := firstTen / 10
+	lastTenAvg := lastTen / 10
+
+	fmt.Printf("     前10次平均: %v\n", firstTenAvg)
+	fmt.Printf("     后10次平均: %v\n", lastTenAvg)
+
+	if firstTenAvg > lastTenAvg {
+		improvement := float64(firstTenAvg-lastTenAvg) / float64(firstTenAvg) * 100
+		fmt.Printf("     🚀 连接复用效果: 延迟降低 %.1f%%\n", improvement)
+	} else {
+		fmt.Printf("     📊 连接复用效果: 延迟相对稳定\n")
+	}
+}
+
+// testBurstConcurrency 测试突发并发场景
+func testBurstConcurrency(client *distributed.DistributedClient) {
+	burstSizes := []int{5, 10, 20, 50}
+
+	for _, burstSize := range burstSizes {
+		var wg sync.WaitGroup
+		start := time.Now()
+
+		// 突发并发请求
+		for i := 0; i < burstSize; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				key := fmt.Sprintf("burst_%d_%d", burstSize, id)
+				value := fmt.Sprintf("burst_value_%d", id)
+				client.Set(key, value)
+				client.Get(key)
+				client.Delete(key)
+			}(i)
+		}
+
+		wg.Wait()
+		duration := time.Since(start)
+
+		fmt.Printf("     突发 %d 并发: 总耗时 %v, 平均 %v/请求\n",
+			burstSize, duration, duration/time.Duration(burstSize))
+	}
+}
+
+// testLongRunning 测试长时间运行场景
+func testLongRunning(client *distributed.DistributedClient) {
+	fmt.Println("     执行30秒长时间运行测试...")
+
+	duration := 30 * time.Second
+	concurrency := 5
+
+	var wg sync.WaitGroup
+	var totalOps int64
+	var totalErrors int64
+
+	start := time.Now()
+	stopChan := make(chan struct{})
+
+	// 启动定时器
+	go func() {
+		time.Sleep(duration)
+		close(stopChan)
+	}()
+
+	// 启动工作协程
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			ops := 0
+			errors := 0
+
+			for {
+				select {
+				case <-stopChan:
+					atomic.AddInt64(&totalOps, int64(ops))
+					atomic.AddInt64(&totalErrors, int64(errors))
+					return
+				default:
+					key := fmt.Sprintf("longrun_%d_%d", workerID, ops)
+					value := fmt.Sprintf("value_%d", ops)
+
+					if err := client.Set(key, value); err != nil {
+						errors++
+					} else {
+						if _, _, err := client.Get(key); err != nil {
+							errors++
+						}
+						client.Delete(key)
+						ops++
+					}
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	actualDuration := time.Since(start)
+
+	avgOps := float64(totalOps) / actualDuration.Seconds()
+	errorRate := float64(totalErrors) / float64(totalOps+totalErrors) * 100
+
+	fmt.Printf("     总操作数: %d\n", totalOps)
+	fmt.Printf("     总错误数: %d\n", totalErrors)
+	fmt.Printf("     平均QPS: %.2f ops/s\n", avgOps)
+	fmt.Printf("     错误率: %.2f%%\n", errorRate)
+	fmt.Printf("     实际运行时间: %v\n", actualDuration)
+
+	if errorRate < 1.0 {
+		fmt.Printf("     🎉 长时间运行稳定性: 优秀\n")
+	} else if errorRate < 5.0 {
+		fmt.Printf("     ✅ 长时间运行稳定性: 良好\n")
+	} else {
+		fmt.Printf("     ⚠️ 长时间运行稳定性: 需要优化\n")
 	}
 }

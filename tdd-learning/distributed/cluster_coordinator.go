@@ -39,9 +39,7 @@ func NewClusterCoordinator(node *DistributedNode, cluster *ClusterManager) *Clus
 	return &ClusterCoordinator{
 		node:    node,
 		cluster: cluster,
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
+		httpClient: createCoordinatorHTTPClient(10 * time.Second),
 	}
 }
 
